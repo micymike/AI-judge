@@ -1,11 +1,16 @@
 import os
 import logging
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
+from docx import Document
+from docx.shared import Pt, RGBColor, Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 import random
 from groq import Groq
 from functools import wraps
 from dotenv import load_dotenv
 import time
+from datetime import datetime
+import io
 from report import report_bp, generate_feedback_summary
 from real_time_feedback import real_time_feedback_bp
 from feedback_processor import feedback_processor_bp
@@ -31,6 +36,86 @@ logger = logging.getLogger(__name__)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 client = Groq(api_key=GROQ_API_KEY)
 
+def create_feedback_document(data, summary):
+    """
+    Create a professionally formatted Word document with the feedback.
+    """
+    doc = Document()
+    
+    # Document title
+    title = doc.add_heading('Pitch Feedback Report', 0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    
+    # Team information
+    doc.add_paragraph()
+    team_info = doc.add_paragraph()
+    team_info.add_run('Team: ').bold = True
+    team_info.add_run(data.get('teamName', 'Not specified'))
+    team_info.add_run('\nPitch Number: ').bold = True
+    team_info.add_run(str(data.get('pitchNumber', 'Not specified')))
+    team_info.add_run('\nSession: ').bold = True
+    team_info.add_run(str(data.get('session', 'Not specified')))
+    team_info.add_run('\nDate: ').bold = True
+    team_info.add_run(datetime.now().strftime('%B %d, %Y'))
+    
+    # Executive Summary
+    doc.add_heading('Executive Summary', 1)
+    doc.add_paragraph(summary)
+    
+    # Detailed Scoring
+    doc.add_heading('Detailed Evaluation', 1)
+    
+    for section in data.get('scoringSections', []):
+        # Section heading
+        section_heading = doc.add_heading(section['title'], 2)
+        
+        # Score and weight information
+        score_info = doc.add_paragraph()
+        score_info.add_run('Score: ').bold = True
+        score_info.add_run(f"{section['score']:.1f}/10")
+        score_info.add_run('\nWeight: ').bold = True
+        score_info.add_run(f"{section['weight']}%")
+        
+        # Question scores
+        if section.get('questionScores'):
+            scores_table = doc.add_table(rows=1, cols=2)
+            scores_table.style = 'Table Grid'
+            header_cells = scores_table.rows[0].cells
+            header_cells[0].text = 'Question'
+            header_cells[1].text = 'Score'
+            
+            for question, score in section['questionScores'].items():
+                row_cells = scores_table.add_row().cells
+                row_cells[0].text = f"Question {int(question) + 1}"
+                row_cells[1].text = f"{score}/10"
+        
+        # Section feedback
+        if section.get('feedback'):
+            doc.add_paragraph()
+            feedback_para = doc.add_paragraph()
+            feedback_para.add_run('Feedback: ').bold = True
+            feedback_para.add_run(section['feedback'])
+        
+        doc.add_paragraph()  # Add spacing between sections
+    
+    # General Feedback
+    if data.get('generalFeedback'):
+        doc.add_heading('General Feedback', 1)
+        doc.add_paragraph(data['generalFeedback'])
+    
+    # Format the document
+    for paragraph in doc.paragraphs:
+        for run in paragraph.runs:
+            run.font.size = Pt(11)
+            run.font.name = 'Calibri'
+    
+    # Save to memory stream
+    doc_stream = io.BytesIO()
+    doc.save(doc_stream)
+    doc_stream.seek(0)
+    
+    return doc_stream
+
 def retry_on_quota_exceeded():
     """Decorator to handle quota exceeded errors with exponential backoff"""
     def decorator(func):
@@ -42,7 +127,6 @@ def retry_on_quota_exceeded():
             for attempt in range(max_retries):
                 try:
                     return func(*args, **kwargs)
-                
                 except Exception as e:
                     if "quota exceeded" in str(e).lower() and attempt < max_retries - 1:
                         delay = (base_delay * 2 ** attempt) + (random.uniform(0, 1))
@@ -56,19 +140,38 @@ def retry_on_quota_exceeded():
     return decorator
 
 @retry_on_quota_exceeded()
-def generate_summary(feedback_list):
+def generate_summary(feedback_data):
     """
-    Summarize feedback using Groq's chat API with retry handling.
+    Generate a comprehensive summary using Groq's chat API.
     """
+    # Prepare structured prompt
+    sections_text = []
+    for section in feedback_data.get('scoringSections', []):
+        sections_text.append(f"\n{section['title']} (Score: {section['score']:.1f}/10):\n{section.get('feedback', 'No feedback provided')}")
+    
     prompt = f"""
-    Summarize the following feedback into three concise, actionable insights:
-    Feedback:
-    {feedback_list}
-    Provide clear and constructive points.
+    Please provide a professional and constructive executive summary of the following pitch feedback:
+    
+    Team: {feedback_data.get('teamName')}
+    Pitch Number: {feedback_data.get('pitchNumber')}
+    Session: {feedback_data.get('session')}
+    
+    Detailed Feedback:
+    {"".join(sections_text)}
+    
+    General Feedback:
+    {feedback_data.get('generalFeedback', 'No general feedback provided')}
+    
+    Please structure the summary to include:
+    1. Overall assessment
+    2. Key strengths
+    3. Areas for improvement
+    4. Strategic recommendations
+    
+    Keep the tone constructive and professional.
     """
     
     try:
-        # Call the Groq API chat completion method
         chat_completion = client.chat.completions.create(
             messages=[
                 {"role": "user", "content": prompt}
@@ -82,7 +185,7 @@ def generate_summary(feedback_list):
             raise ValueError("Empty response received from Groq")
         
         return summary
-
+    
     except Exception as e:
         logger.error(f"Error during summarization: {str(e)}", exc_info=True)
         raise
@@ -90,58 +193,40 @@ def generate_summary(feedback_list):
 @app.route("/summarize_feedback", methods=["POST"])
 def summarize_feedback():
     """
-    API endpoint to summarize feedback, accepting any format (JSON, plain text, or form-encoded data).
+    API endpoint to process feedback and generate a downloadable Word document.
     """
     try:
-        feedback_list = None
-
-        # Check if the request has JSON data
-        if request.is_json:
-            data = request.get_json()
-            feedback_list = data.get("feedback")
-
-        # Check if plain text or form-encoded data is provided
-        elif request.data:
-            feedback_list = request.data.decode('utf-8')
-
-        # Handle form-encoded data (e.g., x-www-form-urlencoded)
-        elif request.form:
-            feedback_list = request.form.get("feedback")
-
-        # If feedback is not provided in any format
-        if not feedback_list:
-            return jsonify({"error": "No feedback provided"}), 400
-
-        # Normalize feedback to a string
-        if isinstance(feedback_list, list):
-            feedback_list = "\n".join(str(item) for item in feedback_list)
-
+        # Get JSON data
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+        
         # Generate summary
         try:
-            summary = generate_feedback_summary({
-                "high_level": feedback_list,
-                "problem": "",
-                "solution": "",
-                "innovation": "",
-                "team": "",
-                "business_model": "",
-                "market_opportunity": "",
-                "technical_feasibility": "",
-                "execution_strategy": "",
-                "communication": ""
-            })
-
-            return jsonify({
-                "summary": summary,
-                "status": "success"
-            }), 200
-
+            summary = generate_summary(data)
+            
+            # Create document
+            doc_stream = create_feedback_document(data, summary)
+            
+            # Generate filename
+            filename = f"{data.get('teamName', 'Team')}_{data.get('pitchNumber', 'Pitch')}_Feedback.docx"
+            filename = "".join(c for c in filename if c.isalnum() or c in ('-', '_')).rstrip()
+            
+            # Return document
+            return send_file(
+                doc_stream,
+                mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                as_attachment=True,
+                download_name=filename
+            )
+            
         except Exception as e:
+            logger.error(f"Error processing feedback: {str(e)}", exc_info=True)
             return jsonify({
                 "error": "An error occurred while processing the feedback",
                 "details": str(e)
             }), 500
-
+            
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}", exc_info=True)
         return jsonify({

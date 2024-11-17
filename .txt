@@ -1,3 +1,5 @@
-curl -X POST http://localhost:5000/feedback_processor/process_feedback \
+curl -X POST http://localhost:5000/report/generate_summary \
 -H "Content-Type: text/plain" \
 -d "Just some plain text that is not JSON."
+
+report
